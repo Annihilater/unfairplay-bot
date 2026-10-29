@@ -17,6 +17,8 @@ jobs:
     outputs:
       changed: ${{ steps.update.outputs.changed }}
       commit: ${{ steps.commit.outputs.commit }}
+      version: ${{ steps.version.outputs.version }}
+      summary: ${{ steps.update.outputs.summary }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -40,12 +42,21 @@ jobs:
           git commit -am "chore(deps): ${{ steps.update.outputs.summary }}"
           git push
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - if: steps.update.outputs.changed == 'true'
+        id: version
+        run: echo "version=$(scripts/next-version.sh)" >> "$GITHUB_OUTPUT"
 
-  # Pushes made with GITHUB_TOKEN do not trigger other workflows, so build here.
-  image:
+  # A release created with GITHUB_TOKEN does not start the release workflow,
+  # so publish from here. That workflow creates the tag and the GitHub release.
+  release:
     needs: update
     if: needs.update.outputs.changed == 'true'
-    uses: ./.github/workflows/image.yml
+    uses: ./.github/workflows/release.yml
     with:
       ref: ${{ needs.update.outputs.commit }}
+      version: ${{ needs.update.outputs.version }}
+      notes: ${{ needs.update.outputs.summary }}
+    permissions:
+      contents: write
+      packages: write
     secrets: inherit

@@ -109,11 +109,26 @@ A `ready` task contains `artifact.download_url`. Other endpoints:
 cache, dependency versions), `GET /healthz`. Download links (`/d/...`) need no
 token and support `Range` requests.
 
+## Release
+
+Pushes to `main` run tests only. A published GitHub Release builds the image and attaches the compose bundle. When the dependency check finds an upgrade, it commits that upgrade and publishes the next patch release through the same workflow, starting at `v0.1.0` when no stable tag exists.
+
+```sh
+git tag v1.0.0 && git push origin v1.0.0
+gh release create v1.0.0 --title v1.0.0 --generate-notes
+```
+
+The release workflow tests that tag, pushes
+`ghcr.io/annihilater/unfairplay-bot:v1.0.0`, moves `:latest` to the same image,
+and uploads `unfairplay-bot-v1.0.0-compose.tar.gz`. The archive contains
+`compose.yaml` (the image tag pinned, no `build`), `.env.example`, and
+`DEPLOY.md`. Image layers stay on GHCR; `docker compose up` pulls the pinned tag.
+
 ## Deploy (Docker Compose)
 
 ```sh
-mkdir -p /opt/unfairplay-bot && cd /opt/unfairplay-bot
-# copy compose.yaml, .env.example and deploy/ from this repository
+tar -xzf unfairplay-bot-v1.0.0-compose.tar.gz
+cd unfairplay-bot-v1.0.0
 cp .env.example .env            # fill in the values
 mkdir -p data ipatool cache secrets/models canary
 cp /path/to/your-model.bin secrets/models/
@@ -127,6 +142,14 @@ docker compose up -d
 # docker compose exec -it bot ipatool auth login --email you@example.com \
 #   --keychain-passphrase "$UNFAIRPLAY_BOT_KEYCHAIN_PASSPHRASE"
 ```
+
+To upgrade, keep `.env`, `data/`, `ipatool/`, `cache/`, `secrets/`, and
+`canary/`. Replace `compose.yaml` with the one from the new archive, then
+`docker compose pull && docker compose up -d`.
+
+`compose.yaml` in this repository still has `build: .` for local development.
+The release archive is the server package. If pulling the image is denied, make
+the GHCR package public or run `docker login ghcr.io` on the server.
 
 `secrets/models` is UnfairPlay's model registry: it may hold several `.bin`
 models, and UnfairPlay picks the one matching each IPA. Add a model by copying
@@ -196,40 +219,22 @@ systemctl start unfairplay-bot-update.timer
 ```
 
 `update.sh` runs hourly: it builds the newest `main` (which includes the
-CI's dependency bumps), runs the tests, then the same two canaries as the
-Docker updater before switching the `current` symlink and restarting while
-idle. Serve it with `deploy/systemd/Caddyfile`.
+CI's dependency bumps), runs the tests, then the App Store and UnfairPlay
+canaries before switching the `current` symlink and restarting while idle.
+Serve it with `deploy/systemd/Caddyfile`.
 
 ## Automatic dependency updates
 
 `deps.env` sets how each dependency is tracked: `main`, `release`, or
 `prerelease`. ipatool is pinned in `go.mod`; UnfairPlay in `deps.env`.
 
-1. `.github/workflows/update-deps.yml` runs every 6 hours. It resolves the
-   newest allowed versions (`scripts/update-deps.sh`), runs vet and race
-   tests, builds both CLIs, commits the bump, and publishes
-   `ghcr.io/annihilater/unfairplay-bot:latest`.
-2. On the server, `deploy/unfairplay-bot-update.timer` runs
-   `deploy/update.sh` hourly. It pulls the image and runs two canaries with
-   the new image before switching:
-   - **App Store:** `unfairplay-bot check` with the existing session, inside
-     the running container's network namespace so the MAC address (ipatool's
-     device identity) is the same. It never signs in. If it fails while the
-     running version is healthy, the update is rejected.
-   - **UnfairPlay:** `unfairplay verify` on an IPA in `./canary` with the
-     private model, offline.
-
-   If both pass, the updater waits for the bot to be idle, then restarts it.
-   If the running version is already unhealthy, it restarts immediately. The
-   bot also drains queued and running tasks on SIGTERM.
-
-```sh
-sudo cp deploy/unfairplay-bot-update.* /etc/systemd/system/
-sudo systemctl enable --now unfairplay-bot-update.timer
-```
+`.github/workflows/update-deps.yml` runs every 6 hours. It resolves the
+newest allowed versions (`scripts/update-deps.sh`), runs vet and race tests,
+builds both CLIs, commits the bump to `main`, and publishes the next patch
+release (`v1.2.3` becomes `v1.2.4`). That release is the image and the compose archive.
 
 Public CI cannot test real downloads or decryption, because they need the
-private session and model. The canary check is the gate for those.
+private session and model.
 
 ## Development
 

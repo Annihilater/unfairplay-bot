@@ -59,9 +59,20 @@ curl -N -H "Authorization: Bearer $TOKEN" https://ipa.example.com/v1/tasks/$ID/e
 
 `ready` 的任务带有 `artifact.download_url`。其他接口：`GET /v1/tasks`，`DELETE /v1/tasks/{id}`（取消，返回 `202`），`GET /v1/status`（队列、缓存、依赖版本、健康状态），`GET /healthz`。下载链接（`/d/...`）不需要 token，支持 `Range`。不带 `Range` 的完整下载会计一次缓存命中；`Range` 请求不计。
 
+## 发版
+
+推送到 `main` 只跑测试，不构建镜像。发布 GitHub Release 才出制品。依赖检查发现升级时，会把升级提交到 `main`，并自动发布下一个补丁版本，走同一条发版流程。还没有任何稳定版本时，从 `v0.1.0` 开始。
+
+```sh
+git tag v1.0.0 && git push origin v1.0.0
+gh release create v1.0.0 --title v1.0.0 --generate-notes
+```
+
+这次 Release 会测试该标签，推送镜像 `ghcr.io/annihilater/unfairplay-bot:v1.0.0`，把 `:latest` 指到同一份镜像，并上传 `unfairplay-bot-v1.0.0-compose.tar.gz`。压缩包里是钉死该版本、没有 `build` 的 `compose.yaml`、`.env.example` 和 `DEPLOY.md`。镜像层在 GHCR，不在压缩包里。服务器上 `docker compose up` 会拉取这个标签。
+
 ## 部署（Docker Compose）
 
-`compose.yaml` 同时写了镜像名和本地构建。`ghcr.io/annihilater/unfairplay-bot:latest` 要等这个仓库的 CI 发布之后才能拉取。第一次部署用源码构建。
+下载这次 Release 的 `unfairplay-bot-<版本>-compose.tar.gz`。
 
 必填环境变量（写在 `.env`，systemd 则写在 `/etc/unfairplay-bot/env`）：
 
@@ -76,15 +87,15 @@ curl -N -H "Authorization: Bearer $TOKEN" https://ipa.example.com/v1/tasks/$ID/e
 开 Telegram 时还要 `UNFAIRPLAY_BOT_TELEGRAM_TOKEN` 和至少一个 `UNFAIRPLAY_BOT_TELEGRAM_ADMIN_IDS`。`UNFAIRPLAY_BOT_APPLE_ID_EMAIL` 和 `UNFAIRPLAY_BOT_APPLE_ID_PASSWORD` 要成对设置，或者都不设。其余项见 `.env.example`，未设置时使用代码里的默认值。
 
 ```sh
-git clone https://github.com/Annihilater/unfairplay-bot /opt/unfairplay-bot
-cd /opt/unfairplay-bot
+tar -xzf unfairplay-bot-v1.0.0-compose.tar.gz
+cd unfairplay-bot-v1.0.0
 cp .env.example .env            # 填好上面的值
 mkdir -p data ipatool cache secrets/models canary
 cp /path/to/your-model.bin secrets/models/
 sudo chown -R 10001:10001 data ipatool cache secrets
 # UnfairPlay 拒绝组或其他用户可读的模型和模型目录。
 sudo chmod 700 secrets/models && sudo chmod 600 secrets/models/*.bin
-docker compose up -d --build
+docker compose up -d
 
 # 设置了 UNFAIRPLAY_BOT_APPLE_ID_* 时，服务会自己登录。两步验证账号可以给机器人发 /login，
 # 或在容器里登录：
@@ -92,7 +103,9 @@ docker compose up -d --build
 #   --keychain-passphrase "$UNFAIRPLAY_BOT_KEYCHAIN_PASSPHRASE"
 ```
 
-镜像已经发布到 GHCR 之后，更新由下面的 timer 拉取。只使用镜像、不在本机构建时，在放有 `compose.yaml`、`.env` 和 `deploy/` 的目录执行 `docker compose pull && docker compose up -d --no-build`。
+升级时保留 `.env`、`data/`、`ipatool/`、`cache/`、`secrets/`、`canary/`，用新部署包里的 `compose.yaml` 换掉旧的，再执行 `docker compose pull && docker compose up -d`。
+
+仓库里的 `compose.yaml` 仍带 `build: .`，那是本机构建用的。服务器用 Release 里的部署包。拉取镜像若被拒绝，把 GHCR 包设为公开，或在服务器上 `docker login ghcr.io`。
 
 `secrets/models` 是 UnfairPlay 的模型目录，可以放多个 `.bin`，UnfairPlay 按每个 IPA 选择匹配的模型。再复制一个 `.bin` 进去即可，不用重启。
 
@@ -137,25 +150,15 @@ systemctl daemon-reload && systemctl enable unfairplay-bot unfairplay-bot-update
 systemctl start unfairplay-bot-update.timer
 ```
 
-`update.sh` 每小时运行：构建最新的 `main`（含 CI 提交的依赖升级），跑测试，再做和 Docker 更新器相同的两项金丝雀检查，然后切换 `current` 符号链接，并在空闲时重启。用 `deploy/systemd/Caddyfile` 对外提供服务。单元文件把监听固定在 `127.0.0.1:8080`，模型目录固定为 `/var/lib/unfairplay-bot/models`，数据目录固定为 `/var/lib/unfairplay-bot/data`。
+`update.sh` 每小时运行：构建最新的 `main`（含 CI 提交的依赖升级），跑测试，再做 App Store 和 UnfairPlay 两项金丝雀检查，然后切换 `current` 符号链接，并在空闲时重启。用 `deploy/systemd/Caddyfile` 对外提供服务。单元文件把监听固定在 `127.0.0.1:8080`，模型目录固定为 `/var/lib/unfairplay-bot/models`，数据目录固定为 `/var/lib/unfairplay-bot/data`。
 
 ## 依赖自动更新
 
 `deps.env` 规定每个依赖怎么跟踪：`main`、`release` 或 `prerelease`。ipatool 的版本钉在 `go.mod`，UnfairPlay 钉在 `deps.env`。
 
-1. `.github/workflows/update-deps.yml` 每 6 小时运行一次。它解析允许范围内的最新版本（`scripts/update-deps.sh`），跑 vet 和 race 测试，构建两个 CLI，提交这次升级，并发布 `ghcr.io/annihilater/unfairplay-bot:latest`。用 `GITHUB_TOKEN` 推送的提交不会触发其他 workflow，所以镜像在这个 workflow 里构建。
-2. 服务器上，`deploy/unfairplay-bot-update.timer` 每小时运行 `deploy/update.sh`。它拉取镜像，并用新镜像做两项金丝雀检查，通过后才切换：
-   - **App Store：** 在正在运行的容器的网络命名空间里执行 `unfairplay-bot check`，这样 MAC 地址（ipatool 的设备身份）不变。它从不登录。当前版本健康而这次检查失败时，拒绝更新。
-   - **UnfairPlay：** 用私有模型对 `./canary` 里的一个 IPA 离线执行 `unfairplay verify`。
+`.github/workflows/update-deps.yml` 每 6 小时运行一次。它解析允许范围内的最新版本（`scripts/update-deps.sh`），跑 vet 和 race 测试，构建两个 CLI，把升级提交到 `main`，并发布下一个补丁版本（`v1.2.3` 变成 `v1.2.4`）。这次 Release 就是镜像和 compose 部署包。
 
-   没设置 `UNFAIRPLAY_BOT_HEALTH_APP_ID`，或 `canary/` 里没有 `.ipa` 时，对应的检查只打印警告并跳过，更新继续。当前版本已经不健康时，新版本的 App Store 检查失败也会直接切换。两项都通过（或被跳过）后，更新器等机器人空闲再重启。服务收到 SIGTERM 时也会把排队和正在运行的任务排空。
-
-```sh
-sudo cp deploy/unfairplay-bot-update.* /etc/systemd/system/
-sudo systemctl enable --now unfairplay-bot-update.timer
-```
-
-公开的 CI 不能测试真实下载或解密，因为那需要私有会话和模型。金丝雀检查是这道门。
+公开的 CI 不能测试真实下载或解密，因为那需要私有会话和模型。
 
 ## 开发
 

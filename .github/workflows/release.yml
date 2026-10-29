@@ -1,0 +1,102 @@
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to build. Defaults to the published release tag.
+        type: string
+        required: false
+      version:
+        description: Version tag. Defaults to the published release tag.
+        type: string
+        required: false
+      notes:
+        description: Release notes used only when this workflow creates the release.
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.event.release.tag_name }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.event.release.tag_name }}
+      - id: meta
+        env:
+          VERSION: ${{ inputs.version || github.event.release.tag_name }}
+        run: |
+          if [[ -z "$VERSION" ]]; then
+            echo "version is required" >&2
+            exit 1
+          fi
+          repo=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${repo}:${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image_latest=ghcr.io/${repo}:latest" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.meta.outputs.image_latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test
+        run: |
+          image=${{ steps.meta.outputs.image }}
+          docker run --rm --entrypoint ipatool "$image" --version
+          docker run --rm --entrypoint unfairplay "$image" --help >/dev/null
+      - name: Package compose bundle
+        run: scripts/package-compose.sh "${{ steps.meta.outputs.version }}" "${{ steps.meta.outputs.image }}"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" dist/*-compose.tar.gz --clobber
+          else
+            if ! git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1; then
+              git tag "$VERSION"
+              git push origin "refs/tags/$VERSION"
+            fi
+            {
+              echo "依赖更新。"
+              echo
+              printf '%s\n' "$NOTES"
+            } > "$RUNNER_TEMP/notes.md"
+            gh release create "$VERSION" dist/*-compose.tar.gz \
+              --title "$VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
